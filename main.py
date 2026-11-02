@@ -116,6 +116,32 @@ def fetch_prime_stocks() -> dict:
     return stocks
 
 
+# ===== 配当の検証 =====
+def verified_dividend_rate(ticker: str, info: dict):
+    """1株あたり年間配当(円)を、複数ソースのうち最も低い値で返す（過大表示の防止）
+    戻り値: (配当額, 採用した算出元)
+    """
+    cands = {}
+    for key, label in (("dividendRate", "info予想"), ("trailingAnnualDividendRate", "info実績")):
+        v = info.get(key) or 0
+        if v > 0:
+            cands[label] = float(v)
+
+    try:
+        divs = yf.Ticker(ticker).dividends  # 株式分割調整済みの実際の配当履歴
+        if divs is not None and len(divs) > 0:
+            idx = divs.index
+            cutoff = pd.Timestamp.now(tz=idx.tz) - pd.Timedelta(days=365)
+            total = float(divs[idx >= cutoff].sum())
+            if total > 0:
+                cands["配当履歴12M"] = total
+    except Exception:  # noqa: BLE001
+        pass  # 履歴が取れなければinfoの値だけで判断
+
+    label = min(cands, key=cands.get)
+    return cands[label], label
+
+
 # ===== 1銘柄の処理 =====
 def _is_rate_limit(e: Exception) -> bool:
     text = f"{type(e).__name__} {e}".lower()
@@ -152,9 +178,18 @@ def process_ticker(ticker: str, meta: dict, retries: int = RETRIES, sleep_sec: f
             if not per or per <= 0 or not pbr or pbr <= 0 or price <= 0 or div_rate <= 0:
                 return "nomatch", None, ""
 
-            dividend_yield = div_rate / price * 100
+            # 事前判定：infoの配当は過大に出ることがあるため、ここでは候補の絞り込みにだけ使う
+            rough_rate = max(
+                info.get("dividendRate") or 0,
+                info.get("trailingAnnualDividendRate") or 0,
+            )
+            if not (per < MAX_PER and pbr < MAX_PBR and rough_rate / price * 100 >= MIN_YIELD):
+                return "nomatch", None, ""
 
-            if per < MAX_PER and pbr < MAX_PBR and dividend_yield >= MIN_YIELD:
+            # 候補だけ、実際の配当履歴（直近12か月・株式分割調整済み）で検証し、最も低い値を採用
+            rate, src = verified_dividend_rate(ticker, info)
+            dividend_yield = rate / price * 100
+            if dividend_yield >= MIN_YIELD:
                 return "match", {
                     "code": code,
                     "name": meta["name"],
@@ -163,6 +198,8 @@ def process_ticker(ticker: str, meta: dict, retries: int = RETRIES, sleep_sec: f
                     "per": per,
                     "pbr": pbr,
                     "yield": dividend_yield,
+                    "div_rate": rate,
+                    "div_src": src,
                 }, ""
             return "nomatch", None, ""
 
@@ -267,7 +304,7 @@ def build_embeds(matches, total, failed_codes, errors, elapsed, today, test_labe
                 lines.append(
                     f"**{i}. [{m['name']}]({url})**\n"
                     f"　`{m['code']}`　{m['sector']}\n"
-                    f"　💰 **{m['yield']:.2f}%**　📈 PER {m['per']:.1f}　📘 PBR {m['pbr']:.2f}"
+                    f"　💰 **{m['yield']:.2f}%**（年{m['div_rate']:g}円）　📈 PER {m['per']:.1f}　📘 PBR {m['pbr']:.2f}"
                 )
             description = "\n\n".join(lines)
             if is_last and len(matches) > TOP_N:
@@ -351,7 +388,8 @@ def mock_process(ticker: str, meta: dict, **kwargs):
     per, pbr, y = rnd.uniform(4, 25), rnd.uniform(0.3, 1.8), rnd.uniform(1, 7)
     if per < MAX_PER and pbr < MAX_PBR and y >= MIN_YIELD:
         return "match", {"code": code, "name": meta["name"], "sector": meta["sector"],
-                         "price": price, "per": per, "pbr": pbr, "yield": y}, ""
+                         "price": price, "per": per, "pbr": pbr, "yield": y,
+                         "div_rate": round(price * y / 100, 1), "div_src": "mock"}, ""
     return "nomatch", None, ""
 
 
@@ -432,6 +470,8 @@ def main(args):
                     "業種": m["sector"],
                     "株価": round(m["price"], 1),
                     "配当利回り(%)": round(m["yield"], 2),
+                    "年間配当(円)": round(m["div_rate"], 2),
+                    "配当算出元": m["div_src"],
                     "PER": round(m["per"], 2),
                     "PBR": round(m["pbr"], 2),
                 }
