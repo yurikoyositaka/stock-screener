@@ -39,7 +39,7 @@ if not WEBHOOK_URL:
 print("JPXサイトから最新の銘柄データURLを検索中...")
 jpx_page_url = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
 headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 }
 
 response = requests.get(jpx_page_url, headers=headers)
@@ -63,14 +63,10 @@ if target_link:
 else:
     raise Exception("JPXのサイトからエクセルファイルが見つかりませんでした。")
 
-# セッションを作成してブラウザのヘッダーを偽装（アクセス拒否を回避）
+# --- 3. セッションとリトライ設定 ---
 session = requests.Session()
-session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8'
-})
+session.headers.update(headers)
 
-# --- 3. 高速＆漏れ防止スクリーニング処理 ---
 def process_ticker(ticker):
     stock_info = stock_dict[ticker]
     stock_name = stock_info["name"]
@@ -85,7 +81,6 @@ def process_ticker(ticker):
             if not info or ("trailingPE" not in info and "priceToBook" not in info and "forwardPE" not in info):
                 raise ValueError("データ未取得")
                 
-            # PER: trailingPE が取れない場合は forwardPE を参照
             per = info.get("trailingPE")
             if per is None or per <= 0:
                 per = info.get("forwardPE", 999)
@@ -101,9 +96,9 @@ def process_ticker(ticker):
                 raw_yield = info.get("dividendYield") or 0
                 dividend_yield = raw_yield * 100 if raw_yield < 1 else raw_yield
             
-            time.sleep(0.05)
+            time.sleep(0.02)
             
-            # 条件判定：PER 15以下 ＆ PBR 1.0以下 ＆ 配当利回り 4.0%以上
+            # スクリーニング条件：PER 15以下 ＆ PBR 1.0以下 ＆ 配当利回り 4.0%以上
             if per < 15 and pbr < 1.0 and dividend_yield >= 4.0:
                 return {
                     "display": f"・{stock_name} [{sector}] ({code_num}) (PER: {per:.1f}, PBR: {pbr:.2f}, 配当: {dividend_yield:.2f}%)",
@@ -118,31 +113,28 @@ def process_ticker(ticker):
                 }
             break
         except Exception:
-            time.sleep(0.3 * (attempt + 1))
+            time.sleep(0.2 * (attempt + 1))
             
     return None
 
 matched_stocks = []
 matched_data_for_csv = []
 
-print("高速＆高精度スクリーニングを開始します（目標時間: 約2分 / 8並列実行）...")
+print("爆速＆全件漏れなしスクリーニングを開始します（目標時間: 約20秒）...")
 start_time = time.time()
 
+# 6並列で一括処理
 completed_count = 0
-# 8スレッド並列実行
-with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
     results = executor.map(process_ticker, all_tickers)
     for res in results:
         completed_count += 1
-        if completed_count % 300 == 0:
-            print(f"{completed_count} / {len(all_tickers)} 件完了...")
-            
         if res:
             matched_stocks.append(res["display"])
             matched_data_for_csv.append(res["csv"])
 
 elapsed = time.time() - start_time
-print(f"\n処理完了！ 実行時間: {elapsed / 60:.2f} 分 ({elapsed:.1f} 秒) / 該当件数: {len(matched_stocks)} 件")
+print(f"\n処理完了！ 実行時間: {elapsed:.1f} 秒 / 該当件数: {len(matched_stocks)} 件")
 
 # --- 4. CSV作成とDiscordへ送信 ---
 if matched_stocks:
