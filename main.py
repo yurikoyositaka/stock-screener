@@ -120,7 +120,7 @@ for idx, chunk in enumerate(ticker_chunks, start=1):
     except Exception as e:
         print(f"バッチ {idx} の取得エラー: {e}")
         
-    time.sleep(0.3) # サーバー負荷防止のわずかな待機
+    time.sleep(0.3)
 
 # --- 4. CSVファイルの作成とDiscordへ通知 ---
 if matched_stocks:
@@ -154,19 +154,4 @@ if matched_stocks:
     if response.status_code in [200, 204]:
         print("\nDiscordへ通知とCSVファイルを送信しました。")
     else:
-        print(f"\n通知エラー: {response.status_code}")
-else:
-    payload = {
-        "embeds": [
-            {
-                "title": "📊 プライム市場 高配当スクリーニングレポート",
-                "description": "本日はスクリーニング条件に合致する銘柄はありませんでした。",
-                "color": int("e74c3c", 16),
-                "footer": {"text": "該当件数: 0件"},
-                "timestamp": datetime.datetime.utcnow().isoformat()
-            }
-        ]
-    }
-    response = requests.post(WEBHOOK_URL, json=payload)
-    if response.status_code in [200, 204]:
-        print("\n該当なしの通知を送信しました。")
+        print(f"\n通知エラー: {response.status
