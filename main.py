@@ -7,6 +7,7 @@ import yfinance as yf
 import datetime
 import sys
 import jpholiday
+import concurrent.futures
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
@@ -64,55 +65,74 @@ if target_link:
 else:
     raise Exception("JPXのサイトからエクセルファイルが見つかりませんでした。")
 
-# --- 3. スクリーニング処理 ---
-matched_stocks = []
-matched_data_for_csv = []
-target_tickers = all_tickers
-
-print("スクリーニングを開始します...")
-for i, ticker in enumerate(target_tickers):
+# --- 3. 単一銘柄の取得処理（リトライ機能付き） ---
+def process_ticker(ticker):
     stock_info = stock_dict[ticker]
     stock_name = stock_info["name"]
     sector = stock_info["sector"]
     code_num = ticker.replace(".T", "")
     
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        
-        per = info.get("trailingPE", 999)
-        pbr = info.get("priceToBook", 999)
-        
-        dividend_rate = info.get("dividendRate", 0)
-        price = info.get("currentPrice", info.get("previousClose", 0))
-        
-        if price > 0 and dividend_rate > 0:
-            dividend_yield = (dividend_rate / price) * 100
-        else:
-            raw_yield = info.get("dividendYield", 0)
-            dividend_yield = raw_yield if raw_yield > 1 else raw_yield * 100
+    # 通信エラー対策として最大2回試行
+    for attempt in range(2):
+        try:
+            stock = yf.Ticker(ticker)
+            info = stock.info
             
-        if per < 15 and pbr < 1.0 and dividend_yield >= 4.0:
-            matched_stocks.append(f"・{stock_name} [{sector}] ({code_num}) (PER: {per:.1f}, PBR: {pbr:.2f}, 配当: {dividend_yield:.2f}%)")
+            per = info.get("trailingPE", 999)
+            pbr = info.get("priceToBook", 999)
             
-            matched_data_for_csv.append({
-                "コード": code_num,
-                "銘柄名": stock_name,
-                "業種": sector,
-                "PER": round(per, 2),
-                "PBR": round(pbr, 2),
-                "配当利回り(%)": round(dividend_yield, 2)
-            })
+            dividend_rate = info.get("dividendRate", 0)
+            price = info.get("currentPrice", info.get("previousClose", 0))
             
-        if (i + 1) % 50 == 0:
-            print(f"{i + 1}件完了...")
+            if price > 0 and dividend_rate > 0:
+                dividend_yield = (dividend_rate / price) * 100
+            else:
+                raw_yield = info.get("dividendYield", 0)
+                dividend_yield = raw_yield if raw_yield > 1 else raw_yield * 100
+                
+            time.sleep(0.1)  # 待機時間を0.1秒に短縮
             
-    except Exception as e:
-        print(f"{stock_name} の取得エラー: {e}")
-        
-    time.sleep(1)
+            if per < 15 and pbr < 1.0 and dividend_yield >= 4.0:
+                return {
+                    "display": f"・{stock_name} [{sector}] ({code_num}) (PER: {per:.1f}, PBR: {pbr:.2f}, 配当: {dividend_yield:.2f}%)",
+                    "csv": {
+                        "コード": code_num,
+                        "銘柄名": stock_name,
+                        "業種": sector,
+                        "PER": round(per, 2),
+                        "PBR": round(pbr, 2),
+                        "配当利回り(%)": round(dividend_yield, 2)
+                    }
+                }
+            break
+        except Exception as e:
+            if attempt == 1:
+                print(f"{stock_name} の取得エラー: {e}")
+            time.sleep(0.5)  # エラー時は少し休んで再試行
+            
+    return None
 
-# --- 4. CSVファイルの作成とDiscordへ通知 ---
+# --- 4. 超高速並列スクリーニング実行 ---
+matched_stocks = []
+matched_data_for_csv = []
+target_tickers = all_tickers
+
+print("超高速スクリーニングを開始します（目標時間: 約1〜2分）...")
+
+completed_count = 0
+# max_workers=10（10並列）に引き上げて処理速度を向上
+with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    results = executor.map(process_ticker, target_tickers)
+    for result in results:
+        completed_count += 1
+        if completed_count % 200 == 0:
+            print(f"{completed_count} / {len(target_tickers)} 件完了...")
+            
+        if result:
+            matched_stocks.append(result["display"])
+            matched_data_for_csv.append(result["csv"])
+
+# --- 5. CSVファイルの作成とDiscordへ通知 ---
 if matched_stocks:
     csv_filename = "screening_result.csv"
     df_result = pd.DataFrame(matched_data_for_csv)
