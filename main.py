@@ -39,10 +39,12 @@ MAX_PER = 15.0        # PER がこれ未満
 MAX_PBR = 1.0         # PBR がこれ未満
 MIN_YIELD = 4.0       # 配当利回り(%)がこれ以上
 
-MAX_WORKERS = 3       # 並列数（多いとYahooに制限されます）
-SLEEP_SEC = 0.3       # 1銘柄ごとの待ち時間
-RETRIES = 3           # リトライ回数
-TOP_N = 20            # Discord本文に表示する最大件数（全件はCSVに添付）
+MAX_WORKERS = 2       # 並列数（多いとYahooに制限されます）
+SLEEP_SEC = 0.5       # 1銘柄ごとの待ち時間
+RETRIES = 4           # 1回のパス内でのリトライ回数
+RETRY_ROUNDS = 3      # 失敗銘柄だけを再取得するラウンド数（直列・長めの待ち時間）
+TOP_N = 30            # Discord本文に表示する最大件数（全件はCSVに添付）
+PAGE_SIZE = 15        # 1メッセージに載せる件数（Discordの文字数上限対策）
 FAIL_WARN_RATIO = 0.2 # 取得失敗がこの割合を超えたら警告を表示
 
 JPX_PAGE_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
@@ -115,12 +117,17 @@ def fetch_prime_stocks() -> dict:
 
 
 # ===== 1銘柄の処理 =====
-def process_ticker(ticker: str, meta: dict):
+def _is_rate_limit(e: Exception) -> bool:
+    text = f"{type(e).__name__} {e}".lower()
+    return "ratelimit" in text or "too many requests" in text or "429" in text
+
+
+def process_ticker(ticker: str, meta: dict, retries: int = RETRIES, sleep_sec: float = SLEEP_SEC):
     """戻り値: (status, data, error)  status = 'match' | 'nomatch' | 'failed'"""
     code = ticker.replace(".T", "")
     last_error = ""
 
-    for attempt in range(RETRIES):
+    for attempt in range(retries):
         try:
             info = yf.Ticker(ticker).info
             if not info or len(info) < 5:
@@ -139,7 +146,7 @@ def process_ticker(ticker: str, meta: dict):
             pbr = info.get("priceToBook")
             div_rate = info.get("dividendRate") or info.get("trailingAnnualDividendRate") or 0
 
-            time.sleep(SLEEP_SEC)
+            time.sleep(sleep_sec)
 
             # 必要な値が揃わない銘柄は対象外
             if not per or per <= 0 or not pbr or pbr <= 0 or price <= 0 or div_rate <= 0:
@@ -161,9 +168,33 @@ def process_ticker(ticker: str, meta: dict):
 
         except Exception as e:  # noqa: BLE001
             last_error = f"{type(e).__name__}: {e}"[:120]
-            time.sleep(2 ** attempt)  # 1秒 → 2秒 → 4秒
+            if _is_rate_limit(e):
+                # レート制限は長めに待つ（10秒 → 20秒 → 30秒…）
+                time.sleep(10 * (attempt + 1) + random.random() * 3)
+            else:
+                # 1秒 → 2秒 → 4秒… + ゆらぎ
+                time.sleep(2 ** attempt + random.random())
 
     return "failed", None, last_error
+
+
+# ===== 並列実行（1パス分） =====
+def run_pass(tickers, stocks, worker, workers, total_label="", **kwargs):
+    """戻り値: (matches, failed)  failed = {ticker: error}"""
+    matches, failed = [], {}
+    total = len(tickers)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(worker, t, stocks[t], **kwargs): t for t in tickers}
+        for done, fut in enumerate(concurrent.futures.as_completed(futures), 1):
+            t = futures[fut]
+            status, data, err = fut.result()
+            if status == "match":
+                matches.append(data)
+            elif status == "failed":
+                failed[t] = err
+            if done % 200 == 0:
+                print(f"  {total_label}進捗 {done}/{total}（該当 {len(matches)} / 失敗 {len(failed)}）")
+    return matches, failed
 
 
 # ===== Discord送信 =====
@@ -177,77 +208,113 @@ def send_discord(payload: dict, csv_path: str | None = None) -> bool:
         if csv_path:
             print(f"（CSV添付予定: {csv_path}）")
         return True
-    try:
-        if csv_path:
-            with open(csv_path, "rb") as f:
-                res = requests.post(
-                    WEBHOOK_URL,
-                    data={"payload_json": json.dumps(payload)},
-                    files={"files[0]": (os.path.basename(csv_path), f, "text/csv")},
-                    timeout=30,
-                )
-        else:
-            res = requests.post(WEBHOOK_URL, json=payload, timeout=30)
-    except Exception as e:  # noqa: BLE001
-        print(f"Discord送信中に例外: {e}")
-        return False
 
-    if res.status_code in (200, 204):
-        print("Discordへ送信しました。")
-        return True
-    print(f"Discord送信エラー: {res.status_code} {res.text[:300]}")
+    for attempt in range(3):
+        try:
+            if csv_path:
+                with open(csv_path, "rb") as f:
+                    res = requests.post(
+                        WEBHOOK_URL,
+                        data={"payload_json": json.dumps(payload)},
+                        files={"files[0]": (os.path.basename(csv_path), f, "text/csv")},
+                        timeout=30,
+                    )
+            else:
+                res = requests.post(WEBHOOK_URL, json=payload, timeout=30)
+        except Exception as e:  # noqa: BLE001
+            print(f"Discord送信中に例外: {e}")
+            return False
+
+        if res.status_code in (200, 204):
+            print("Discordへ送信しました。")
+            return True
+        if res.status_code == 429:  # Discord側のレート制限
+            try:
+                wait = float(res.json().get("retry_after", 2))
+            except Exception:  # noqa: BLE001
+                wait = 2
+            time.sleep(wait + 0.5)
+            continue
+        print(f"Discord送信エラー: {res.status_code} {res.text[:300]}")
+        return False
     return False
 
 
-def build_embed(matches, total, failed, errors, elapsed, today, test_label="") -> dict:
+def build_embeds(matches, total, failed_codes, errors, elapsed, today, test_label="") -> list:
+    """Discordのembedを複数ページに分けて返す（最後のページに集計情報を載せる）"""
+    failed = len(failed_codes)
     fail_ratio = failed / total if total else 0
     warn = fail_ratio > FAIL_WARN_RATIO
+    base_title = f"{test_label}📊 プライム市場 高配当・割安スクリーニング（{today:%Y/%m/%d}）"
+
+    top = matches[:TOP_N]
+    pages = [top[i:i + PAGE_SIZE] for i in range(0, len(top), PAGE_SIZE)] or [[]]
 
     if matches:
-        lines = []
-        for i, m in enumerate(matches[:TOP_N], 1):
-            url = f"https://finance.yahoo.co.jp/quote/{m['code']}.T"
-            lines.append(
-                f"**{i}. [{m['name']}]({url})** `{m['code']}`\n"
-                f"　{m['sector']}\n"
-                f"　💰 **{m['yield']:.2f}%**　📈 PER {m['per']:.1f}　📘 PBR {m['pbr']:.2f}"
-            )
-        description = "\n\n".join(lines)
-        if len(matches) > TOP_N:
-            description += f"\n\n…他 {len(matches) - TOP_N} 件は添付CSVをご確認ください"
         color = COLOR_WARN if warn else COLOR_OK
     else:
-        description = "本日は条件に合致する銘柄はありませんでした。"
         color = COLOR_WARN if warn else COLOR_NONE
 
-    fields = [
-        {
-            "name": "🔎 スクリーニング条件",
-            "value": f"PER < {MAX_PER:g} ／ PBR < {MAX_PBR:g} ／ 配当利回り ≥ {MIN_YIELD:g}%",
-            "inline": False,
-        },
-        {"name": "✅ 該当", "value": f"{len(matches)} 件", "inline": True},
-        {"name": "📋 対象", "value": f"{total} 銘柄", "inline": True},
-        {"name": "⚠️ 取得失敗", "value": f"{failed} 銘柄", "inline": True},
-    ]
-    if warn:
-        sample = "\n".join(errors[:3]) or "(詳細なし)"
-        fields.append(
-            {
-                "name": "⚠️ データ取得に失敗した銘柄が多く、結果が不完全な可能性があります",
-                "value": f"```\n{sample}\n```",
-                "inline": False,
-            }
-        )
+    embeds = []
+    for p_idx, page in enumerate(pages):
+        start = p_idx * PAGE_SIZE
+        is_last = p_idx == len(pages) - 1
 
-    return {
-        "title": f"{test_label}📊 プライム市場 高配当・割安スクリーニング（{today:%Y/%m/%d}）",
-        "description": description[:4000],
-        "color": color,
-        "fields": fields,
-        "footer": {"text": f"実行時間 {elapsed:.0f}秒 ｜ 配当利回り順に表示"},
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-    }
+        if page:
+            lines = []
+            for i, m in enumerate(page, start + 1):
+                url = f"https://finance.yahoo.co.jp/quote/{m['code']}.T"
+                lines.append(
+                    f"**{i}. [{m['name']}]({url})**\n"
+                    f"　`{m['code']}`　{m['sector']}\n"
+                    f"　💰 **{m['yield']:.2f}%**　📈 PER {m['per']:.1f}　📘 PBR {m['pbr']:.2f}"
+                )
+            description = "\n\n".join(lines)
+            if is_last and len(matches) > TOP_N:
+                description += f"\n\n…他 {len(matches) - TOP_N} 件は添付CSVをご確認ください"
+        else:
+            description = "本日は条件に合致する銘柄はありませんでした。"
+
+        title = base_title if len(pages) == 1 else f"{base_title} {p_idx + 1}/{len(pages)}"
+        embed = {
+            "title": title,
+            "description": description[:4000],
+            "color": color,
+        }
+
+        if is_last:
+            embed["fields"] = [
+                {
+                    "name": "🔎 スクリーニング条件",
+                    "value": f"PER < {MAX_PER:g} ／ PBR < {MAX_PBR:g} ／ 配当利回り ≥ {MIN_YIELD:g}%",
+                    "inline": False,
+                },
+                {"name": "✅ 該当", "value": f"{len(matches)} 件", "inline": True},
+                {"name": "📋 対象", "value": f"{total} 銘柄", "inline": True},
+                {"name": "⚠️ 取得失敗", "value": f"{failed} 銘柄", "inline": True},
+            ]
+            if failed:
+                codes = "、".join(failed_codes[:30])
+                if failed > 30:
+                    codes += f" …他{failed - 30}件"
+                sample = "\n".join(errors[:3]) or "(詳細なし)"
+                name = (
+                    "⚠️ データ取得に失敗した銘柄が多く、結果が不完全な可能性があります"
+                    if warn
+                    else "⚠️ 再試行しても取得できなかった銘柄"
+                )
+                embed["fields"].append(
+                    {
+                        "name": name,
+                        "value": f"{codes}\n```\n{sample}\n```"[:1000],
+                        "inline": False,
+                    }
+                )
+            embed["footer"] = {"text": f"実行時間 {elapsed:.0f}秒 ｜ 配当利回り順に表示"}
+            embed["timestamp"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        embeds.append(embed)
+    return embeds
 
 
 # ===== メイン =====
@@ -274,11 +341,11 @@ def mock_stocks(n: int = 100) -> dict:
     }
 
 
-def mock_process(ticker: str, meta: dict):
+def mock_process(ticker: str, meta: dict, **kwargs):
     """ネットワークを使わないダミー判定（レイアウト確認用）"""
     code = ticker.replace(".T", "")
     rnd = random.Random(ticker)
-    if rnd.random() < 0.03:
+    if rnd.random() < 0.03 and "retries" not in kwargs:
         return "failed", None, "MockError: ダミーの取得失敗"
     price = rnd.uniform(300, 5000)
     per, pbr, y = rnd.uniform(4, 25), rnd.uniform(0.3, 1.8), rnd.uniform(1, 7)
@@ -320,28 +387,41 @@ def main(args):
         print(f"[テスト] 先頭 {len(tickers)} 銘柄のみ処理します。")
     total = len(tickers)
 
-    matches, errors, failed = [], [], 0
     start = time.time()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(worker, t, stocks[t]): t for t in tickers}
-        for done, fut in enumerate(concurrent.futures.as_completed(futures), 1):
-            status, data, err = fut.result()
-            if status == "match":
-                matches.append(data)
-            elif status == "failed":
-                failed += 1
-                if err and err not in errors:
-                    errors.append(err)
-            if done % 200 == 0:
-                print(f"  進捗 {done}/{total}（該当 {len(matches)} / 失敗 {failed}）")
+    # 1回目：全銘柄
+    matches, failed = run_pass(tickers, stocks, worker, MAX_WORKERS)
+    print(f"1回目完了: 該当 {len(matches)} 件 / 失敗 {len(failed)} 件")
+
+    # 2回目以降：失敗した銘柄だけを、直列・長めの待ち時間で再取得
+    for r in range(1, RETRY_ROUNDS + 1):
+        if not failed:
+            break
+        wait = 30 * r
+        print(f"再取得ラウンド {r}/{RETRY_ROUNDS}: {len(failed)} 銘柄を {wait}秒後に再試行します。")
+        time.sleep(wait)
+        m2, failed = run_pass(
+            list(failed.keys()), stocks, worker, 1,
+            total_label=f"再取得{r} ", retries=6, sleep_sec=1.0,
+        )
+        matches += m2
+        print(f"  → 追加で該当 {len(m2)} 件 / まだ失敗 {len(failed)} 件")
 
     elapsed = time.time() - start
     matches.sort(key=lambda m: m["yield"], reverse=True)
-    print(f"完了: 該当 {len(matches)} 件 / 失敗 {failed} 件 / {elapsed:.0f}秒")
 
-    embed = build_embed(matches, total, failed, errors, elapsed, today, test_label)
+    failed_codes = [t.replace(".T", "") for t in failed]
+    errors = []
+    for err in failed.values():
+        if err and err not in errors:
+            errors.append(err)
+    if failed_codes:
+        print(f"最終的に取得できなかった銘柄: {', '.join(failed_codes)}")
+    print(f"完了: 該当 {len(matches)} 件 / 失敗 {len(failed_codes)} 件 / {elapsed:.0f}秒")
 
+    embeds = build_embeds(matches, total, failed_codes, errors, elapsed, today, test_label)
+
+    csv_path = None
     if matches:
         csv_path = "screening_result_test.csv" if test else "screening_result.csv"
         pd.DataFrame(
@@ -358,9 +438,13 @@ def main(args):
                 for m in matches
             ]
         ).to_csv(csv_path, index=False, encoding="utf-8-sig")
-        send_discord({"embeds": [embed]}, csv_path)
-    else:
-        send_discord({"embeds": [embed]})
+
+    # ページごとに送信（CSVは最後のメッセージに添付）
+    for i, embed in enumerate(embeds):
+        is_last = i == len(embeds) - 1
+        send_discord({"embeds": [embed]}, csv_path if is_last else None)
+        if not is_last:
+            time.sleep(1)
 
 
 if __name__ == "__main__":
