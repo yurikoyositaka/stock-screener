@@ -63,36 +63,45 @@ if target_link:
 else:
     raise Exception("JPXのサイトからエクセルファイルが見つかりませんでした。")
 
-# --- 3. 漏れ防止・高精度並列スクリーニング処理 ---
+# セッションを作成してブラウザのヘッダーを偽装（アクセス拒否を回避）
+session = requests.Session()
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept-Language': 'ja,en-US;q=0.9,en;q=0.8'
+})
+
+# --- 3. 高速＆漏れ防止スクリーニング処理 ---
 def process_ticker(ticker):
     stock_info = stock_dict[ticker]
     stock_name = stock_info["name"]
     sector = stock_info["sector"]
     code_num = ticker.replace(".T", "")
     
-    # 通信エラーやアクセス拒否対策として最大3回リトライ
     for attempt in range(3):
         try:
-            stock = yf.Ticker(ticker)
+            stock = yf.Ticker(ticker, session=session)
             info = stock.info
             
-            # データが空の場合はエラーを出してリトライに回す
-            if not info or ("trailingPE" not in info and "priceToBook" not in info):
+            if not info or ("trailingPE" not in info and "priceToBook" not in info and "forwardPE" not in info):
                 raise ValueError("データ未取得")
                 
-            per = info.get("trailingPE", 999)
+            # PER: trailingPE が取れない場合は forwardPE を参照
+            per = info.get("trailingPE")
+            if per is None or per <= 0:
+                per = info.get("forwardPE", 999)
+                
             pbr = info.get("priceToBook", 999)
             
-            price = info.get("regularMarketPrice", info.get("previousClose", 0))
-            div_rate = info.get("dividendRate", 0)
+            price = info.get("regularMarketPrice") or info.get("currentPrice") or info.get("previousClose") or 0
+            div_rate = info.get("dividendRate") or 0
             
             if price > 0 and div_rate > 0:
                 dividend_yield = (div_rate / price) * 100
             else:
-                raw_yield = info.get("dividendYield", 0)
+                raw_yield = info.get("dividendYield") or 0
                 dividend_yield = raw_yield * 100 if raw_yield < 1 else raw_yield
             
-            time.sleep(0.15)  # ブロック回避用の安全待機時間
+            time.sleep(0.05)
             
             # 条件判定：PER 15以下 ＆ PBR 1.0以下 ＆ 配当利回り 4.0%以上
             if per < 15 and pbr < 1.0 and dividend_yield >= 4.0:
@@ -107,21 +116,21 @@ def process_ticker(ticker):
                         "配当利回り(%)": round(dividend_yield, 2)
                     }
                 }
-            break  # 正常に取得・判定できたらリトライループを脱出
+            break
         except Exception:
-            time.sleep(0.5 * (attempt + 1))  # 失敗時は徐々に待機時間を延ばして再試行
+            time.sleep(0.3 * (attempt + 1))
             
     return None
 
 matched_stocks = []
 matched_data_for_csv = []
 
-print("高精度スクリーニングを開始します（目標時間: 約2分半〜3分 / 4並列実行）...")
+print("高速＆高精度スクリーニングを開始します（目標時間: 約2分 / 8並列実行）...")
 start_time = time.time()
 
 completed_count = 0
-# 4スレッド並列実行（ブロックを防ぎつつ安定抽出）
-with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+# 8スレッド並列実行
+with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
     results = executor.map(process_ticker, all_tickers)
     for res in results:
         completed_count += 1
