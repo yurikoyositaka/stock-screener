@@ -63,20 +63,22 @@ if target_link:
 else:
     raise Exception("JPXのサイトからエクセルファイルが見つかりませんでした。")
 
-# --- 3. 高速並列スクリーニング処理（10並列 / 待機時間0.05秒） ---
+# --- 3. 漏れ防止・高精度並列スクリーニング処理 ---
 def process_ticker(ticker):
     stock_info = stock_dict[ticker]
     stock_name = stock_info["name"]
     sector = stock_info["sector"]
     code_num = ticker.replace(".T", "")
     
-    for attempt in range(2):
+    # 通信エラーやアクセス拒否対策として最大3回リトライ
+    for attempt in range(3):
         try:
             stock = yf.Ticker(ticker)
             info = stock.info
             
+            # データが空の場合はエラーを出してリトライに回す
             if not info or ("trailingPE" not in info and "priceToBook" not in info):
-                raise ValueError("データ取得失敗")
+                raise ValueError("データ未取得")
                 
             per = info.get("trailingPE", 999)
             pbr = info.get("priceToBook", 999)
@@ -90,7 +92,7 @@ def process_ticker(ticker):
                 raw_yield = info.get("dividendYield", 0)
                 dividend_yield = raw_yield * 100 if raw_yield < 1 else raw_yield
             
-            time.sleep(0.05)  # 待機時間を0.05秒に設定
+            time.sleep(0.15)  # ブロック回避用の安全待機時間
             
             # 条件判定：PER 15以下 ＆ PBR 1.0以下 ＆ 配当利回り 4.0%以上
             if per < 15 and pbr < 1.0 and dividend_yield >= 4.0:
@@ -105,21 +107,21 @@ def process_ticker(ticker):
                         "配当利回り(%)": round(dividend_yield, 2)
                     }
                 }
-            break
+            break  # 正常に取得・判定できたらリトライループを脱出
         except Exception:
-            time.sleep(0.2)
+            time.sleep(0.5 * (attempt + 1))  # 失敗時は徐々に待機時間を延ばして再試行
             
     return None
 
 matched_stocks = []
 matched_data_for_csv = []
 
-print("高速並列スクリーニングを開始します（目標時間: 約3〜5分）...")
+print("高精度スクリーニングを開始します（目標時間: 約2分半〜3分 / 4並列実行）...")
 start_time = time.time()
 
 completed_count = 0
-# 10スレッド並列実行
-with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+# 4スレッド並列実行（ブロックを防ぎつつ安定抽出）
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
     results = executor.map(process_ticker, all_tickers)
     for res in results:
         completed_count += 1
