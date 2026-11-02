@@ -1,0 +1,7 @@
+requests
+pandas
+yfinance
+beautifulsoup4
+jpholiday
+xlrd
+openpyxl
