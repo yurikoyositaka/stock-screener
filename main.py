@@ -3,11 +3,9 @@ import time
 import requests
 import json
 import pandas as pd
-import yfinance as yf
 import datetime
 import sys
 import jpholiday
-import concurrent.futures
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
@@ -65,74 +63,66 @@ if target_link:
 else:
     raise Exception("JPXのサイトからエクセルファイルが見つかりませんでした。")
 
-# --- 3. 単一銘柄の取得処理（リトライ機能付き） ---
-def process_ticker(ticker):
-    stock_info = stock_dict[ticker]
-    stock_name = stock_info["name"]
-    sector = stock_info["sector"]
-    code_num = ticker.replace(".T", "")
+# --- 3. 一括（バッチ）通信による爆速スクリーニング ---
+matched_stocks = []
+matched_data_for_csv = []
+
+# 100銘柄ごとにグループ化（全17回程度のリクエストで完了）
+chunk_size = 100
+ticker_chunks = [all_tickers[i:i + chunk_size] for i in range(0, len(all_tickers), chunk_size)]
+
+print(f"爆速一括スクリーニングを開始します（リクエスト数: 全{len(ticker_chunks)}回 / 目標時間: 約10秒）...")
+
+for idx, chunk in enumerate(ticker_chunks, start=1):
+    symbols_str = ",".join(chunk)
+    quote_url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbols_str}"
     
-    # 通信エラー対策として最大2回試行
-    for attempt in range(2):
-        try:
-            stock = yf.Ticker(ticker)
-            info = stock.info
+    try:
+        res = requests.get(quote_url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            results = data.get("quoteResponse", {}).get("result", [])
             
-            per = info.get("trailingPE", 999)
-            pbr = info.get("priceToBook", 999)
-            
-            dividend_rate = info.get("dividendRate", 0)
-            price = info.get("currentPrice", info.get("previousClose", 0))
-            
-            if price > 0 and dividend_rate > 0:
-                dividend_yield = (dividend_rate / price) * 100
-            else:
-                raw_yield = info.get("dividendYield", 0)
-                dividend_yield = raw_yield if raw_yield > 1 else raw_yield * 100
+            for item in results:
+                ticker = item.get("symbol")
+                if not ticker or ticker not in stock_dict:
+                    continue
                 
-            time.sleep(0.1)  # 待機時間を0.1秒に短縮
-            
-            if per < 15 and pbr < 1.0 and dividend_yield >= 4.0:
-                return {
-                    "display": f"・{stock_name} [{sector}] ({code_num}) (PER: {per:.1f}, PBR: {pbr:.2f}, 配当: {dividend_yield:.2f}%)",
-                    "csv": {
+                stock_info = stock_dict[ticker]
+                stock_name = stock_info["name"]
+                sector = stock_info["sector"]
+                code_num = ticker.replace(".T", "")
+                
+                per = item.get("trailingPE", 999)
+                pbr = item.get("priceToBook", 999)
+                
+                # 株価と配当金の取得・利回り計算
+                price = item.get("regularMarketPrice", item.get("previousClose", 0))
+                div_rate = item.get("trailingAnnualDividendRate", 0)
+                
+                if price > 0 and div_rate > 0:
+                    dividend_yield = (div_rate / price) * 100
+                else:
+                    raw_yield = item.get("trailingAnnualDividendYield", 0)
+                    dividend_yield = raw_yield * 100 if raw_yield < 1 else raw_yield
+                
+                # 条件判定：PER 15以下 ＆ PBR 1.0以下 ＆ 配当利回り4.0%以上
+                if per < 15 and pbr < 1.0 and dividend_yield >= 4.0:
+                    matched_stocks.append(f"・{stock_name} [{sector}] ({code_num}) (PER: {per:.1f}, PBR: {pbr:.2f}, 配当: {dividend_yield:.2f}%)")
+                    matched_data_for_csv.append({
                         "コード": code_num,
                         "銘柄名": stock_name,
                         "業種": sector,
                         "PER": round(per, 2),
                         "PBR": round(pbr, 2),
                         "配当利回り(%)": round(dividend_yield, 2)
-                    }
-                }
-            break
-        except Exception as e:
-            if attempt == 1:
-                print(f"{stock_name} の取得エラー: {e}")
-            time.sleep(0.5)  # エラー時は少し休んで再試行
-            
-    return None
+                    })
+    except Exception as e:
+        print(f"バッチ {idx} の取得エラー: {e}")
+        
+    time.sleep(0.3) # サーバー負荷防止のわずかな待機
 
-# --- 4. 超高速並列スクリーニング実行 ---
-matched_stocks = []
-matched_data_for_csv = []
-target_tickers = all_tickers
-
-print("超高速スクリーニングを開始します（目標時間: 約1〜2分）...")
-
-completed_count = 0
-# max_workers=10（10並列）に引き上げて処理速度を向上
-with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-    results = executor.map(process_ticker, target_tickers)
-    for result in results:
-        completed_count += 1
-        if completed_count % 200 == 0:
-            print(f"{completed_count} / {len(target_tickers)} 件完了...")
-            
-        if result:
-            matched_stocks.append(result["display"])
-            matched_data_for_csv.append(result["csv"])
-
-# --- 5. CSVファイルの作成とDiscordへ通知 ---
+# --- 4. CSVファイルの作成とDiscordへ通知 ---
 if matched_stocks:
     csv_filename = "screening_result.csv"
     df_result = pd.DataFrame(matched_data_for_csv)
@@ -172,6 +162,7 @@ else:
                 "title": "📊 プライム市場 高配当スクリーニングレポート",
                 "description": "本日はスクリーニング条件に合致する銘柄はありませんでした。",
                 "color": int("e74c3c", 16),
+                "footer": {"text": "該当件数: 0件"},
                 "timestamp": datetime.datetime.utcnow().isoformat()
             }
         ]
